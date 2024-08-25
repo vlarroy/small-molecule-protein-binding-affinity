@@ -1,0 +1,17 @@
+rdkit
+pickle5
+numpy
+pandas
+duckdb
+plotly
+pyarrow
+kaleido
+dask
+py3Dmol
+
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+tqdm
