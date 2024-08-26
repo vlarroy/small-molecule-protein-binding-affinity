@@ -1,7 +1,5 @@
-rdkit
-numpy
-pandas
-duckdb
-torch
-torch-geometric
-tqdm
+rdkit==2024.3.5
+numpy==2.1.0
+pandas==2.2.2
+torch==2.4.0
+torch-geometric==2.5.3

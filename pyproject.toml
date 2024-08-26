@@ -1,0 +1,30 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "rdkit==2024.3.5",
+    "numpy==2.1.0",
+    "pandas==2.2.2",
+    "torch==2.4.0",
+    "torch-geometric==2.5.3"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smp_binding_affinity_ladynamic"
+version = "0.0.1"
+authors = [
+  { name="Verónica Larroy Trueba", email="veronicalarroy@gmail.com" },
+  { name="Iván López López", email="ivanlopezlopez1997@gmail.com" },
+]
+description = "Predict small molecule-protein interactions using the Big Encoded Library for Chemical Assessment (BELKA)"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/vlarroy/small-molecule-protein-binding-affinity"
+Issues = "https://github.com/vlarroy/small-molecule-protein-binding-affinity/issues"
