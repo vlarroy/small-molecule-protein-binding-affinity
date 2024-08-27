@@ -1,3 +1,4 @@
+import random
 from typing import List
 from rdkit import Chem
 import torch
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import logging as log
 
+from google.cloud import storage
 from datatypes import Protein, Molecule
 
 
@@ -60,6 +62,8 @@ class SMPBindingAffinityModel:
 
     def __init__(
             self,
+            gcs_bucket_name: str,
+            gcs_model_path: str,
             binding_threshold = 0.8,
             train_test_size = 0.2,
             train_test_random_state = 42,
@@ -72,6 +76,8 @@ class SMPBindingAffinityModel:
             train_learning_rate = 0.001
         ):
         
+        self.gcs_bucket_name = gcs_bucket_name
+        self.gcs_model_path = gcs_model_path
         self.binding_threshold = binding_threshold
         self.train_test_size = train_test_size
         self.train_test_random_state = train_test_random_state
@@ -82,6 +88,27 @@ class SMPBindingAffinityModel:
         self.train_num_layers = train_num_layers
         self.train_dropout_rate = train_dropout_rate
         self.train_learning_rate = train_learning_rate
+
+    def _balance_molecules(self, molecules: List[Molecule]) -> List[Molecule]:
+        # Get the count of binded and non-binded molecules
+        binded_count = sum([molecule.is_binded for molecule in molecules])
+        non_binded_count = len(molecules) - binded_count
+
+        # Get the minimum count
+        min_count = min(binded_count, non_binded_count)
+
+        # Get a random sample of molecules with the minimum count
+        if binded_count == min_count:
+            molecules = [molecule for molecule in molecules if molecule.is_binded]
+            molecules += random.sample([molecule for molecule in molecules if not molecule.is_binded], min_count)
+        else:
+            molecules = [molecule for molecule in molecules if not molecule.is_binded]
+            molecules += random.sample([molecule for molecule in molecules if molecule.is_binded], min_count)
+
+        # Shuffle the train molecules
+        random.shuffle(molecules)
+
+        return molecules
 
     def _one_hot_encoding(self, element, permitted_elements):
         """
@@ -96,32 +123,52 @@ class SMPBindingAffinityModel:
 
     def _get_bond_features(self, bond):
 
-        #Simplified list of bond types
-        permitted_bond_types = [Chem.rdchem.BondType.SINGLE, Chem.rdchem.BondType.DOUBLE, Chem.rdchem.BondType.TRIPLE, Chem.rdchem.BondType.AROMATIC, 'Unknown']
-        bond_type = bond.GetBondType() if bond.GetBondType() in permitted_bond_types else 'Unknown'
+        bond_type = bond.GetBondType()
 
-        #Features: Bon type, is in a ring
-        features = self._one_hot_encoding(bond_type, permitted_bond_types) + [int(bond.IsInRing())]
+        features = [
+            int(bond_type == Chem.rdchem.BondType.SINGLE),
+            int(bond_type == Chem.rdchem.BondType.DOUBLE),
+            int(bond_type == Chem.rdchem.BondType.TRIPLE),
+            int(bond_type == Chem.rdchem.BondType.AROMATIC),
+            int(bond.IsInRing()),
+            int(bond.GetIsConjugated()),
+        ]
         
         return np.array(features, dtype=np.float32)
 
-    def _get_atom_features(self, atom, use_chirality=True):
+    def _get_atom_features(self, atom):
         
         #Define a simplified list of atom types
-        permitted_atom_types = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'Dy', 'Unknown']
+        permitted_atom_types = [
+            'C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg',
+            'Na', 'Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl',
+            'Yb', 'Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H',
+            'Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr', 'Cr',
+            'Pt', 'Hg', 'Pb', 'Dy', 'Unknown'
+        ]
         atom_type = atom.GetSymbol() if atom.GetSymbol() in permitted_atom_types else 'Unknown'
         atom_type_enc = self._one_hot_encoding(atom_type, permitted_atom_types)
 
-        #Consider only the most impactful atom features: atom degree and whether the atom is in a ring
-        atom_degree = self._one_hot_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 'MoreThanFour'])
+        hybridization_type = [
+            Chem.rdchem.HybridizationType.S,
+            Chem.rdchem.HybridizationType.SP,
+            Chem.rdchem.HybridizationType.SP2,
+            Chem.rdchem.HybridizationType.SP3,
+            Chem.rdchem.HybridizationType.SP3D
+        ]
+        atom_hybridization_type = self._one_hot_encoding(atom.GetHybridization(), hybridization_type)
+
+        atom_degree = self._one_hot_encoding(atom.GetDegree(), [0, 1, 2, 3, 4, 5])
+
         is_in_ring = [int(atom.IsInRing())]
 
-        #Optionally include chirality
-        if use_chirality:
-            chirality_enc = self._one_hot_encoding(str(atom.GetChiralTag()), ["CHI_UNSPECIFIED", "CHI_TETRAHEDRAL_CW", "CHI_TETRAHEDRAL_CCW", "CHI_OTHER"])
-            atom_features = atom_type_enc + atom_degree + is_in_ring + chirality_enc
-        else:
-            atom_features = atom_type_enc + atom_degree + is_in_ring
+        total_hs = self._one_hot_encoding(atom.GetTotalNumHs(), [0, 1, 2, 3, 4, 5])
+
+        implicit_valence = self._one_hot_encoding(atom.GetImplicitValence(), [0, 1, 2, 3, 4, 5])
+
+        chirality = self._one_hot_encoding(str(atom.GetChiralTag()), ["CHI_UNSPECIFIED", "CHI_TETRAHEDRAL_CW", "CHI_TETRAHEDRAL_CCW", "CHI_OTHER"])
+        
+        atom_features = atom_type_enc + atom_degree + is_in_ring + total_hs + implicit_valence + atom_hybridization_type + chirality
         
         return np.array(atom_features, dtype=np.float32)
     
@@ -179,10 +226,30 @@ class SMPBindingAffinityModel:
 
         return data_list
     
-    def predict(self, protein: Protein, molecules: List[Molecule]) -> List[Molecule]:
+    def _upload_model_to_gcs(self, local_path):
+        client = storage.Client()
+        bucket = client.bucket(self.gcs_bucket_name)
+        blob = bucket.blob(self.gcs_model_path)
+        blob.upload_from_filename(local_path)
+        log.info(f"Model uploaded to GCS at gs://{self.gcs_bucket_name}/{self.gcs_model_path}")
 
-        #TODO: Load the model from GCS
-        model = torch.load(f'{protein.acronym}_model.pt')
+    def _download_model_from_gcs(self, local_path):
+        client = storage.Client()
+        bucket = client.bucket(self.gcs_bucket_name)
+        blob = bucket.blob(self.gcs_model_path)
+        blob.download_to_filename(local_path)
+        log.info(f"Model downloaded from GCS at gs://{self.gcs_bucket_name}/{self.gcs_model_path}")
+
+    def predict(self, protein: Protein, molecules: List[Molecule], custom_binding_threshold: float = None) -> List[Molecule]:
+        
+        # Load the model from GCS
+        model_path = f'{protein.acronym}_model.pt'
+        self._download_model_from_gcs(model_path)
+        model = torch.load(model_path)
+
+        binding_threshold = self.binding_threshold
+        if custom_binding_threshold is not None:
+            binding_threshold = custom_binding_threshold
 
         data = self._preprocess_data(molecules)
 
@@ -198,28 +265,49 @@ class SMPBindingAffinityModel:
                 predictions.extend(output.view(-1).tolist())
                 predicted_molecules.extend(data.molecule)
 
+
         for i in range(len(predictions)):
-            predicted_molecules[i].is_binded = True if predictions[i] > self.binding_threshold else False
+            predicted_molecules[i].binding_affinity = predictions[i]
+            predicted_molecules[i].is_binded = True if predictions[i] > binding_threshold else False
 
         return predicted_molecules
         
     
     def train(self, protein: Protein, molecules: List[Molecule]) -> None:
 
-        #TODO: Get samples automatically with the minimum of the two binding counts
+        balanced_molecules = self._balance_molecules(molecules)
 
-        train_molecules, test_molecules = train_test_split(molecules, test_size=self.train_test_size, random_state=self.train_test_random_state)
+        train_molecules, test_molecules = train_test_split(balanced_molecules, test_size=self.train_test_size, random_state=self.train_test_random_state)
 
-        test_molecules_without_binding = copy.deepcopy(test_molecules)
-        for molecule in test_molecules_without_binding:
-            molecule.is_binded = None
+        test_molecules_without_binding = map(lambda x: setattr(x, 'is_binded', None), copy.deepcopy(test_molecules))
 
+        log.info(f"""Training on {len(train_molecules)} molecules, testing on {len(test_molecules)} molecules
+            Configuration:
+            - Binding threshold: {self.binding_threshold}
+            - Train-test split: {self.train_test_size}
+            - Random state: {self.train_test_random_state}
+            - Batch size: {self.batch_size}
+            - Hidden dim: {self.train_hidden_dim}
+            - Num epochs: {self.train_num_epochs}
+            - Num layers: {self.train_num_layers}
+            - Dropout rate: {self.train_dropout_rate}
+            - Learning rate: {self.train_learning_rate}
+            - Data loader shuffle: {self.data_loader_shuffle}
+            Other information:
+            - Protein: {protein.acronym}
+            - Molecules: {len(molecules)}
+            - Train molecules: {len(train_molecules)} (binding: {sum([molecule.is_binded for molecule in train_molecules])}, non-binding: {len(train_molecules) - sum([molecule.is_binded for molecule in train_molecules])})
+            - Test molecules without binding: {len(test_molecules_without_binding)}
+            - Test molecules with binding: {len(test_molecules)}""")
+        
+        log.info('Starting preprocess...')
         train_data = self._preprocess_data(train_molecules)
 
-        loader = DataLoader(train_data, batch_size=self.batch_size, shuffle=self.data_loader_shuffle)
+        train_loader = DataLoader(train_data, batch_size=self.batch_size, shuffle=self.data_loader_shuffle)
 
-        train_input_dim = loader.dataset[0].num_node_features
+        train_input_dim = train_loader.dataset[0].num_node_features
 
+        log.info('Preprocess finished. Starting training...')
         model = _GNNModel(train_input_dim, self.train_hidden_dim, self.train_num_layers, self.train_dropout_rate)
         optimizer = optim.AdamW(model.parameters(), lr=self.train_learning_rate)
         criterion = BCEWithLogitsLoss()
@@ -227,7 +315,7 @@ class SMPBindingAffinityModel:
         for epoch in range(self.train_num_epochs):
             model.train()
             total_loss = 0
-            for batch in loader:
+            for batch in train_loader:
                 optimizer.zero_grad()
                 out = model(batch)
                 loss = criterion(out, batch.y.view(-1,1).float())
@@ -235,14 +323,17 @@ class SMPBindingAffinityModel:
                 optimizer.step()
                 total_loss += loss.item()
 
-            log.info(f'Epoch {epoch+1}/{self.train_num_epochs}, Loss: {total_loss / len(loader)}')
+            log.info(f'Epoch {epoch+1}/{self.train_num_epochs}, Loss: {total_loss / len(train_loader)}')
         
-        #TODO: Save the model in GCS
-        torch.save(model, f'{protein.acronym}_model.pt')
+        # Save the model in GCS
+        model_path = f'{protein.acronym}_model.pt'
+        torch.save(model, model_path)
+        self._upload_model_to_gcs(model_path)
 
+        log.info('Training finished. Starting evaluation...')
         predicted_molecules = self.predict(protein, test_molecules_without_binding)
 
         log.info(classification_report(
-            [predicted_molecules[i].is_binded for i in range(len(predicted_molecules))], 
+            [predicted_molecules[i].is_binded for i in range(len(predicted_molecules))],
             [test_molecules[i].is_binded for i in range(len(test_molecules))]
         ))
